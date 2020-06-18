@@ -1,0 +1,909 @@
+---
+title: "STAT 149 Final Project"
+author: "Kenneth Chen, George Hu, Kay Lu"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries}
+# load necessary libraries
+library(arm) # for binned residual plots
+library(car) # for checking collinearity with VIF
+library(DMwR) # for SMOTE
+library(mgcv) # for gam
+library(nnet) # for fitting multinomial response models
+library(rpart) # for fitting tree models
+library(rpart.plot) # for plotting tree models
+
+```
+
+# Initial models
+
+```{r exploration}
+# load heart attack dataset
+ami_data=read.csv("amidata.csv")
+
+# for one patient with LOS=0, replace with LOS=1
+ami_data[ami_data$LOS < 1, ]$LOS = 1
+
+# ensure factor variables
+ami_data$DIAGNOSIS = as.factor(ami_data$DIAGNOSIS)
+ami_data$DRG = as.factor(ami_data$DRG)
+ami_data$DIED = as.factor(ami_data$DIED)
+ami_data$SEX = as.factor(ami_data$SEX)
+
+# plot histogram of responses
+hist(ami_data$LOS, breaks=seq(0,39,1), 
+     main="Histogram of LOS Observations", 
+     xlab="Length of Stay (Days)")
+table(ami_data$LOS)
+nrow(ami_data[ami_data$LOS == 1, ])
+
+mean(ami_data$LOS)
+var(ami_data$LOS)
+
+# faulty model with Patient predictor
+summary(lm(LOS ~ AGE + SEX + Patient + DIAGNOSIS, data=ami_data))
+
+# conduct initial analysis of response variable
+plot(LOS ~ AGE + SEX + DIAGNOSIS, data=ami_data, 
+     main="LOS vs Died", xlab="Predictor", ylab="LOS (Days)", cex = 0.5)
+
+# to generate variance inflation factors, use regular lm()
+ami_regr = lm(LOS ~ AGE + SEX + DIAGNOSIS + Patient, data=ami_data)
+
+# print vif analysis
+vif(ami_regr)
+
+# subset data into deaths and survivors
+deaths = ami_data[ami_data$DIED == 1, ]
+survivors = ami_data[ami_data$DIED == 0, ]
+
+# compare LOS for two groups
+hist(deaths$LOS, breaks=30)
+hist(survivors$LOS, breaks=30)
+
+# of those who stayed 1 day, how many were deaths?
+day1_discharges = ami_data[ami_data$LOS == 1,]
+table(day1_discharges$DIED)
+
+```
+
+```{r pois response}
+# fit preliminary model
+summary(ami.pois <- glm(LOS ~ AGE + SEX + DIAGNOSIS, family=poisson, data=ami_data))
+
+# calculate diagnostics
+ami.pois.fitted = fitted(ami.pois)
+ami.pois.resid = residuals(ami.pois, type="response")
+ami.pois.devresid = residuals(ami.pois, type="deviance")
+ami.pois.cooks = cooks.distance(ami.pois)
+
+# residual plot (deviance residuals)
+png("pois_devresid_plot.png") 
+plot(ami.pois.fitted, ami.pois.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for baseline Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("pois_binnedresid_plot.png") 
+binnedplot(ami.pois.fitted, ami.pois.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for baseline Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("pois_cooks_plot.png") 
+plot(ami.pois.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for baseline Poisson GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+```{r negbin response}
+# fit model accounting for overdispersion
+summary(ami.nb <- glm.nb(LOS ~ AGE + SEX + DIAGNOSIS, data=ami_data))
+
+# calculate diagnostics
+ami.nb.fitted = fitted(ami.nb)
+ami.nb.resid = residuals(ami.nb, type="response")
+ami.nb.devresid = residuals(ami.nb, type="deviance")
+ami.nb.cooks = cooks.distance(ami.nb)
+
+# residual plot (deviance residuals)
+png("nb_devresid_plot.png") 
+plot(ami.nb.fitted, ami.nb.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for baseline NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("nb_binnedresid_plot.png") 
+binnedplot(ami.nb.fitted, ami.nb.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for baseline NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("nb_cooks_plot.png")
+plot(ami.nb.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for baseline NB GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+```{r tweedie response}
+# fit model accounting for positive skewness: Tweedie
+summary(ami.tw <- gam(LOS ~ AGE + SEX + DIAGNOSIS, family=tw(link="log"), data=ami_data))
+
+# fit gamma
+summary(ami.gamma <- glm(LOS ~ AGE + SEX + DIAGNOSIS, family=Gamma(log), data=ami_data))
+
+# calculate diagnostics
+ami.gamma.fitted = fitted(ami.gamma)
+ami.gamma.resid = residuals(ami.gamma, type="response")
+ami.gamma.devresid = residuals(ami.gamma, type="deviance")
+ami.gamma.cooks = cooks.distance(ami.gamma)
+
+# residual plot (deviance residuals)
+png("gamma_devresid_plot.png") 
+plot(ami.gamma.fitted, ami.gamma.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for baseline Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("gamma_binnedresid_plot.png") 
+binnedplot(ami.gamma.fitted, ami.gamma.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for baseline Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("gamma_cooks_plot.png")
+plot(ami.gamma.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for baseline Gamma GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+# Modeling observations with LOS=1
+
+```{r implement hurdle}
+# create new predictors based on two key groups: immediate deaths and false alarms
+ami_data$IMMED_DEATH = as.factor(ifelse((ami_data$LOS < 2 & ami_data$DIED == 1), 1, 0))
+ami_data$FALSE_ALARM = as.factor(ifelse((ami_data$LOS < 2 & ami_data$DIED == 0), 1, 0))
+ami_data$DAY_ONE = as.factor("STAY")
+ami_data$DAY_ONE = as.factor(ifelse((ami_data$LOS < 2 & ami_data$DIED == 1), "DIED", as.character(ami_data$DAY_ONE)))
+ami_data$DAY_ONE = as.factor(ifelse((ami_data$LOS < 2 & ami_data$DIED == 0), "DISCHARGE", as.character(ami_data$DAY_ONE)))
+ami_data
+
+```
+
+```{r examine some proportions}
+# proportion of died
+nrow(ami_data[ami_data$DIED == 1, ])/nrow(ami_data)
+
+# proportion of immediate death among deaths
+nrow(ami_data[ami_data$IMMED_DEATH == 1, ])/nrow(ami_data[ami_data$DIED == 1, ])
+
+# proportion of immediate death among total
+nrow(ami_data[ami_data$IMMED_DEATH == 1, ])/nrow(ami_data)
+
+# proportion of false alarm among total
+nrow(ami_data[ami_data$FALSE_ALARM == 1, ])/nrow(ami_data)
+
+# proportion of LOS == 1 over total
+nrow(ami_data[ami_data$LOS < 2, ])/nrow(ami_data)
+
+# proportion of eventual death (deaths - immediate deaths) over total
+nrow(ami_data[ami_data$DIED == 1 & ami_data$DAY_ONE == "STAY", ])/nrow(ami_data)
+
+# proportion of eventual discharge (survive - false alarm) over total
+nrow(ami_data[ami_data$DIED == 0 & ami_data$DAY_ONE == "STAY", ])/nrow(ami_data)
+
+```
+
+```{r show need for hurdle}
+# likelihood ratio tests on new predictors
+full1.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + IMMED_DEATH + FALSE_ALARM, family=Gamma(log), data=ami_data)
+
+reduced1.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + FALSE_ALARM, family=Gamma(log), data=ami_data)
+
+reduced2.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + IMMED_DEATH, family=Gamma(log), data=ami_data)
+
+anova(full1.glm, reduced1.glm, test="F")
+
+anova(full1.glm, reduced2.glm, test="F")
+
+full2.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + DAY_ONE, family=Gamma(log), data=ami_data)
+
+reduced3.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS, family=Gamma(log), data=ami_data)
+
+anova(full2.glm, reduced3.glm, test="F")
+
+```
+
+```{r predict day_one}
+set.seed(10)
+
+# initial distribution for DAY_ONE
+table(ami_data$DAY_ONE)
+
+# SMOTE for DIED
+died_smoted = SMOTE(DAY_ONE ~ AGE + SEX + DIAGNOSIS, ami_data, perc.over=500, perc.under=0)
+table(died_smoted$DAY_ONE)
+
+# SMOTE for DISCHARGE
+discharge_smoted = SMOTE(DAY_ONE ~ AGE + SEX + DIAGNOSIS, rbind(ami_data, died_smoted), perc.over=500, perc.under=0)
+table(discharge_smoted$DAY_ONE)
+
+# new ami_data with extra rows
+ami_smoted = rbind(ami_data, died_smoted, discharge_smoted)
+table(ami_smoted$DAY_ONE)
+
+# multinomial predictions
+ami.mtnom = nnet::multinom(DAY_ONE ~ AGE + SEX + DIAGNOSIS, data=ami_smoted)
+summary(ami.mtnom)
+predictions = predict(ami.mtnom, newdata=ami_data, type="class")
+table(predictions)
+
+# predicted vs observed data frame
+observed_values = ami_data$DAY_ONE
+results = as.data.frame(cbind(predictions, observed_values))
+
+# preview table showing how predictions compare with actual outcomes
+head(results,20)
+
+# overall accuracy
+nrow(results[(results$predictions == results$observed_values), ])/nrow(results)
+
+# accuracy for value 1
+nrow(results[(results$predictions == results$observed_values) & (results$predictions == 1), ])/nrow(results[(results$observed_values == 1), ])
+
+# accuracy for value 2
+nrow(results[(results$predictions == results$observed_values) & (results$predictions == 2), ])/nrow(results[(results$observed_values == 2), ])
+
+# accuracy for value 3
+nrow(results[(results$predictions == results$observed_values) & (results$observed_values == 3), ])/nrow(results[(results$observed_values == 3), ])
+
+# unskilled model prediction if naive prediction defaulted to STAY
+nrow(ami_data[ami_data$DAY_ONE == "STAY", ])/nrow(ami_data)
+
+```
+
+```{r try predicting using smoted data via a tree}
+# fit base tree model for classification
+dayone1.tree = rpart(DAY_ONE ~ AGE + SEX + DIAGNOSIS, cp=0.001, data=ami_smoted, method="class", parms=list(split="information"))
+
+# optimize the cp parameter using the 1-SE rule
+printcp(dayone1.tree)
+plotcp(dayone1.tree)
+
+# fit new tree model
+dayone2.tree = prune.rpart(dayone1.tree, cp=0.0012)
+
+# print tree visualization and summary
+prp(dayone2.tree, type=0, digits=3, main="Classification Tree")
+
+# show predictions struggle with DISCHARGE
+predictions = predict(dayone2.tree, ami_data, type="class")
+table(predictions)
+table(ami_data$DAY_ONE)
+
+```
+
+# Model data after removing LOS=1 observations
+
+```{r model on data starting day 2}
+ami2 = ami_data[ami_data$LOS > 1, ]
+ami2$LOS = ami2$LOS - 1
+
+```
+
+```{r negbin response 2}
+# plot histogram of responses
+hist(ami2$LOS, breaks=seq(-1,38,1), 
+     main="Histogram of LOS Observations", 
+     xlab="Length of Stay (Days)")
+table(ami2$LOS)
+
+# fit model accounting for overdispersion
+summary(ami2.nb <- glm.nb(LOS ~ AGE + SEX + DIAGNOSIS, data=ami2))
+
+# calculate diagnostics
+ami2.nb.fitted = fitted(ami2.nb)
+ami2.nb.resid = residuals(ami2.nb, type="response")
+ami2.nb.devresid = residuals(ami2.nb, type="deviance")
+ami2.nb.cooks = cooks.distance(ami2.nb)
+
+# residual plot (deviance residuals)
+plot(ami2.nb.fitted, ami2.nb.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for NB GLM")
+abline(h=0,lty=2,col="green")
+
+# binned residual plot
+binnedplot(ami2.nb.fitted, ami2.nb.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for NB GLM")
+abline(h=0,lty=2,col="green")
+
+# cooks distances
+plot(ami2.nb.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for NB GLM")
+abline(h=1,lty=2,col="red")
+
+```
+
+```{r tweedie response 2}
+# fit model accounting for positive skewness: Tweedie
+summary(ami2.tw <- gam(LOS ~ AGE + SEX + DIAGNOSIS, family=tw(link="log"), data=ami2))
+summary(ami2.gamma <- glm(LOS ~ AGE + SEX + DIAGNOSIS, family=Gamma(log), data=ami2))
+
+# calculate diagnostics
+ami2.gamma.fitted = fitted(ami2.gamma)
+ami2.gamma.resid = residuals(ami2.gamma, type="response")
+ami2.gamma.devresid = residuals(ami2.gamma, type="deviance")
+ami2.gamma.cooks = cooks.distance(ami2.gamma)
+
+# residual plot (deviance residuals)
+plot(ami2.gamma.fitted, ami2.gamma.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for Gamma GLM")
+abline(h=0,lty=2,col="green")
+
+# binned residual plot
+binnedplot(ami2.gamma.fitted, ami2.gamma.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for Gamma GLM")
+abline(h=0,lty=2,col="green")
+
+# cooks distances
+plot(ami2.gamma.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for Gamma GLM")
+abline(h=1,lty=2,col="red")
+
+```
+
+# Examine if post-hoc variables are worth predicting and use those predictions as inputs to models
+
+```{r function to mean interpolate and create new NA contrast-coded binary predictor, echo=FALSE}
+source("na_convert.R")
+
+```
+
+```{r F-tests for post-hoc predictors, showing should consider in model via prediction}
+# interpolate missing data like in CHARGES
+ami2 = na.convert.mean(ami2)
+ami2$CHARGES.na = as.factor(ami2$CHARGES.na)
+
+# base glm
+base.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS, family=Gamma(log), data=ami2)
+
+# SHOULD WE PREDICT CHARGES?
+charge1.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + CHARGES + CHARGES.na, family=Gamma(log), data=ami2)
+anova(base.glm, charge1.glm, test="F")
+
+# SHOULD WE PREDICT DIED?
+died1.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + DIED, family=Gamma(log), data=ami2)
+anova(base.glm, died1.glm, test="F")
+
+# SHOULD WE PREDICT DRG?
+drg1.glm = glm(LOS ~ AGE + SEX + DIAGNOSIS + DRG, family=Gamma(log), data=ami2)
+anova(base.glm, drg1.glm, test="F")
+
+```
+
+# For predictions, see predictions_r_code.rmd
+
+# creation of final dataframe and inferring best model
+
+```{r prepare data and create AGEGROUP predictor}
+# fresh data
+ami_data=read.csv("amidata.csv")
+ami_data=ami_data[ami_data$LOS > 1, ]
+
+# ensure factor variables
+ami_data$DIAGNOSIS = as.factor(ami_data$DIAGNOSIS)
+ami_data$DRG = as.factor(ami_data$DRG)
+ami_data$DIED = as.factor(ami_data$DIED)
+ami_data$SEX = as.factor(ami_data$SEX)
+
+# create new column to group ages (to group shared characteristics)
+ami_data$AGEGROUP = cut(ami_data$AGE, breaks=c(0,34,44,54,64,74,84,120),                          labels=c("0-34","35-44","45-54","55-64","65-74","75-84","85+"), 
+                         ordered=T)
+
+# load CHARGES_PRED and DIED_PRED
+load("CHARGES_PRED.rda")
+ami_data$CHARGES_PRED = as.numeric(CHARGES_PRED)
+load("DIED_PRED_TREE.rda")
+ami_data$DIED_PRED = as.factor(DIED_PRED_TREE)
+
+# split on DIED_PRED
+survivals = ami_data[ami_data$DIED_PRED==0,]
+deaths = ami_data[ami_data$DIED_PRED==1,]
+
+# introduce DRG.na for survivals
+survivals$DRG.na = as.factor(ifelse((survivals$DRG == 123), 1, 0))
+
+```
+
+```{r analysis of deviance to find best model for survivals}
+# first predictor
+m1 = glm(LOS ~ 1, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE, family=Gamma(log), data=survivals)
+m3 = glm(LOS ~ 1 + SEX, family=Gamma(log), data=survivals)
+m4 = glm(LOS ~ 1 + DIAGNOSIS,family=Gamma(log), data=survivals)
+m5 = glm(LOS ~ 1 + DRG, family=Gamma(log), data=survivals)
+m6 = glm(LOS ~ 1 + DRG.na, family=Gamma(log), data=survivals)
+m7 = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=survivals)
+m8 = glm(LOS ~ 1 + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+anova(m1, m6, test="F") 
+anova(m1, m7, test="F") 
+anova(m1, m8, test="F") 
+
+# second predictor
+m1 = glm(LOS ~ 1 + AGE, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE + SEX, family=Gamma(log), data=survivals)
+m3 = glm(LOS ~ 1 + AGE + DIAGNOSIS,family=Gamma(log), data=survivals)
+m4 = glm(LOS ~ 1 + AGE + DRG, family=Gamma(log), data=survivals)
+m5 = glm(LOS ~ 1 + AGE + DRG.na, family=Gamma(log), data=survivals)
+m6 = glm(LOS ~ 1 + AGE + CHARGES_PRED, family=Gamma(log), data=survivals)
+m7 = glm(LOS ~ 1 + AGE + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+anova(m1, m6, test="F") 
+anova(m1, m7, test="F") 
+
+# third predictor
+m1 = glm(LOS ~ 1 + AGE + DRG, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE + DRG + SEX, family=Gamma(log), data=survivals)
+m3 = glm(LOS ~ 1 + AGE + DRG + DIAGNOSIS,family=Gamma(log), data=survivals)
+m4 = glm(LOS ~ 1 + AGE + DRG + CHARGES_PRED, family=Gamma(log), data=survivals)
+m5 = glm(LOS ~ 1 + AGE + DRG + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+
+# fourth predictor
+m1 = glm(LOS ~ 1 + AGE + DRG + SEX, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE + DRG + SEX + DIAGNOSIS,family=Gamma(log), data=survivals)
+m3 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED, family=Gamma(log), data=survivals)
+m4 = glm(LOS ~ 1 + AGE + DRG + SEX + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+
+# fifth predictor
+m1 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+m3 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+
+# sixth predictor
+m1 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+m2 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+anova(m1, m2, test="F") 
+
+# first interaction
+mb0 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+
+ma1 = glm(LOS ~ 1 + AGE * DRG + SEX + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+ma2 = glm(LOS ~ 1 + AGE * SEX + DRG + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+ma3 = glm(LOS ~ 1 + AGE * CHARGES_PRED + DRG + SEX + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+ma4 = glm(LOS ~ 1 + AGE * DIAGNOSIS + DRG + SEX + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+ma5 = glm(LOS ~ 1 + AGE * AGEGROUP + DRG + SEX + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+md1 = glm(LOS ~ 1 + AGE + DRG * SEX + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+md2 = glm(LOS ~ 1 + AGE + DRG * CHARGES_PRED + SEX + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+md3 = glm(LOS ~ 1 + AGE + DRG * DIAGNOSIS + SEX + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+md4 = glm(LOS ~ 1 + AGE + DRG * AGEGROUP + SEX + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+ms1 = glm(LOS ~ 1 + AGE + DRG + SEX * CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+ms2 = glm(LOS ~ 1 + AGE + DRG + SEX * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+ms3 = glm(LOS ~ 1 + AGE + DRG + SEX * AGEGROUP + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+mc1 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED * DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+mc2 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED * AGEGROUP + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+mi1 = glm(LOS ~ 1 + AGE + DRG + SEX + CHARGES_PRED + DIAGNOSIS * AGEGROUP, family=Gamma(log), data=survivals)
+
+anova(mb0, ma1, test="F") 
+anova(mb0, ma2, test="F") 
+anova(mb0, ma3, test="F") 
+anova(mb0, ma4, test="F") 
+anova(mb0, ma5, test="F") 
+
+anova(mb0, md1, test="F") 
+anova(mb0, md2, test="F") 
+anova(mb0, md3, test="F") 
+anova(mb0, md4, test="F") 
+
+anova(mb0, ms1, test="F") 
+anova(mb0, ms2, test="F") 
+anova(mb0, ms3, test="F") 
+
+anova(mb0, mc1, test="F") 
+anova(mb0, mc2, test="F") 
+
+anova(mb0, mi1, test="F") 
+
+# second interaction
+mb0 = glm(LOS ~ 1 + DRG * SEX + AGE + CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+
+ma1 = glm(LOS ~ 1 + DRG * SEX + AGE * CHARGES_PRED + DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+ma2 = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+ma3 = glm(LOS ~ 1 + DRG * SEX + AGE * AGEGROUP + CHARGES_PRED + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+mc1 = glm(LOS ~ 1 + DRG * SEX + AGE + CHARGES_PRED * DIAGNOSIS + AGEGROUP, family=Gamma(log), data=survivals)
+mc2 = glm(LOS ~ 1 + DRG * SEX + AGE + CHARGES_PRED * AGEGROUP + DIAGNOSIS, family=Gamma(log), data=survivals)
+
+mi0 = glm(LOS ~ 1 + DRG * SEX + AGE + CHARGES_PRED + DIAGNOSIS * AGEGROUP, family=Gamma(log), data=survivals)
+
+anova(mb0, ma1, test="F") 
+anova(mb0, ma2, test="F") 
+anova(mb0, ma3, test="F") 
+
+anova(mb0, mc1, test="F") 
+anova(mb0, mc2, test="F") 
+
+anova(mb0, mi0, test="F") 
+
+# third interaction
+mb0 = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+
+mc1 = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED * AGEGROUP, family=Gamma(log), data=survivals)
+
+anova(mb0, mc1, test="F") 
+
+# best model
+best_survivor_model = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+summary(best_survivor_model)
+
+```
+
+```{r analysis of deviance to find best model for deaths}
+# first predictor
+m1 = glm(LOS ~ 1, family=Gamma(log), data=deaths)
+m2 = glm(LOS ~ 1 + AGE, family=Gamma(log), data=deaths)
+m3 = glm(LOS ~ 1 + SEX, family=Gamma(log), data=deaths)
+m4 = glm(LOS ~ 1 + DIAGNOSIS,family=Gamma(log), data=deaths)
+m5 = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=deaths)
+m6 = glm(LOS ~ 1 + AGEGROUP, family=Gamma(log), data=deaths)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+anova(m1, m6, test="F") 
+
+# second predictor
+m1 = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=deaths)
+m2 = glm(LOS ~ 1 + CHARGES_PRED + AGE, family=Gamma(log), data=deaths)
+m3 = glm(LOS ~ 1 + CHARGES_PRED + SEX, family=Gamma(log), data=deaths)
+m4 = glm(LOS ~ 1 + CHARGES_PRED + DIAGNOSIS,family=Gamma(log), data=deaths)
+m5 = glm(LOS ~ 1 + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=deaths)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+
+# interaction terms
+m1 = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=deaths)
+m2 = glm(LOS ~ 1 + CHARGES_PRED + AGE : SEX, family=Gamma(log), data=deaths)
+m3 = glm(LOS ~ 1 + CHARGES_PRED + AGE : DIAGNOSIS, family=Gamma(log), data=deaths)
+m4 = glm(LOS ~ 1 + CHARGES_PRED + AGE : AGEGROUP,family=Gamma(log), data=deaths)
+m5 = glm(LOS ~ 1 + CHARGES_PRED + SEX : DIAGNOSIS, family=Gamma(log), data=deaths)
+m6 = glm(LOS ~ 1 + CHARGES_PRED + SEX : AGEGROUP,family=Gamma(log), data=deaths)
+m7 = glm(LOS ~ 1 + CHARGES_PRED + DIAGNOSIS : AGEGROUP,family=Gamma(log), data=deaths)
+anova(m1, m2, test="F") 
+anova(m1, m3, test="F") 
+anova(m1, m4, test="F") 
+anova(m1, m5, test="F") 
+anova(m1, m6, test="F") 
+anova(m1, m7, test="F") 
+
+# best model
+best_death_model = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=deaths)
+summary(best_death_model)
+
+```
+
+```{r fit best models using pois}
+# fit survivors
+ami.pois = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=poisson, data=survivals)
+
+# calculate diagnostics
+ami.pois.fitted = fitted(ami.pois)
+ami.pois.resid = residuals(ami.pois, type="response")
+ami.pois.devresid = residuals(ami.pois, type="deviance")
+ami.pois.cooks = cooks.distance(ami.pois)
+
+# residual plot (deviance residuals)
+png("best_pois_devresid_survivors_plot.png") 
+plot(ami.pois.fitted, ami.pois.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_pois_binnedresid_survivors_plot.png") 
+binnedplot(ami.pois.fitted, ami.pois.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_pois_cooks_survivors_plot.png") 
+plot(ami.pois.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best Poisson GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+# fit deaths
+ami.pois = glm(LOS ~ 1 + CHARGES_PRED, family=poisson, data=deaths)
+
+# calculate diagnostics
+ami.pois.fitted = fitted(ami.pois)
+ami.pois.resid = residuals(ami.pois, type="response")
+ami.pois.devresid = residuals(ami.pois, type="deviance")
+ami.pois.cooks = cooks.distance(ami.pois)
+
+# residual plot (deviance residuals)
+png("best_pois_devresid_deaths_plot.png") 
+plot(ami.pois.fitted, ami.pois.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_pois_binnedresid_deaths_plot.png") 
+binnedplot(ami.pois.fitted, ami.pois.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best Poisson GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_pois_cooks_deaths_plot.png") 
+plot(ami.pois.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best Poisson GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+```{r fit best models using negbin}
+# fit survivors
+ami.nb = glm.nb(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, data=survivals)
+
+# calculate diagnostics
+ami.nb.fitted = fitted(ami.nb)
+ami.nb.resid = residuals(ami.nb, type="response")
+ami.nb.devresid = residuals(ami.nb, type="deviance")
+ami.nb.cooks = cooks.distance(ami.nb)
+
+# residual plot (deviance residuals)
+png("best_nb_devresid_survivors_plot.png") 
+plot(ami.nb.fitted, ami.nb.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_nb_binnedresid_survivors_plot.png") 
+binnedplot(ami.nb.fitted, ami.nb.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_nb_cooks_survivors_plot.png")
+plot(ami.nb.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best NB GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+# fit deaths
+ami.nb = glm.nb(LOS ~ 1 + CHARGES_PRED, data=deaths)
+
+# calculate diagnostics
+ami.nb.fitted = fitted(ami.nb)
+ami.nb.resid = residuals(ami.nb, type="response")
+ami.nb.devresid = residuals(ami.nb, type="deviance")
+ami.nb.cooks = cooks.distance(ami.nb)
+
+# residual plot (deviance residuals)
+png("best_nb_devresid_deaths_plot.png") 
+plot(ami.nb.fitted, ami.nb.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_nb_binnedresid_deaths_plot.png") 
+binnedplot(ami.nb.fitted, ami.nb.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best NB GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_nb_cooks_deaths_plot.png")
+plot(ami.nb.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best NB GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+```{r fit best models using gamma}
+# fit survivors
+ami.gamma = glm(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + CHARGES_PRED + AGEGROUP, family=Gamma(log), data=survivals)
+
+# calculate diagnostics
+ami.gamma.fitted = fitted(ami.gamma)
+ami.gamma.resid = residuals(ami.gamma, type="response")
+ami.gamma.devresid = residuals(ami.gamma, type="deviance")
+ami.gamma.cooks = cooks.distance(ami.gamma)
+
+# residual plot (deviance residuals)
+png("best_gamma_devresid_survivors_plot.png") 
+plot(ami.gamma.fitted, ami.gamma.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_gamma_binnedresid_survivors_plot.png") 
+binnedplot(ami.gamma.fitted, ami.gamma.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_gamma_cooks_survivors_plot.png")
+plot(ami.gamma.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best Gamma GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+# fit deaths
+ami.gamma = glm(LOS ~ 1 + CHARGES_PRED, family=Gamma(log), data=deaths)
+
+# calculate diagnostics
+ami.gamma.fitted = fitted(ami.gamma)
+ami.gamma.resid = residuals(ami.gamma, type="response")
+ami.gamma.devresid = residuals(ami.gamma, type="deviance")
+ami.gamma.cooks = cooks.distance(ami.gamma)
+
+# residual plot (deviance residuals)
+png("best_gamma_devresid_deaths_plot.png") 
+plot(ami.gamma.fitted, ami.gamma.devresid,
+  xlab="Fitted values",
+  ylab="Deviance residuals",
+  pch=19, col="red", cex=1.5,
+  main="Fitted vs deviance residual plot for best Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# binned residual plot
+png("best_gamma_binnedresid_deaths_plot.png") 
+binnedplot(ami.gamma.fitted, ami.gamma.resid,
+  xlab="Fitted values",
+  ylab="Avg of binned residuals",
+  pch=19, col.pts="red", cex.pts=1.5,
+  main="Fitted vs binned residual plot for best Gamma GLM")
+abline(h=0,lty=2,col="green")
+dev.off()
+
+# cooks distances
+png("best_gamma_cooks_deaths_plot.png")
+plot(ami.gamma.cooks, type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances for best Gamma GLM")
+abline(h=1,lty=2,col="red")
+dev.off()
+
+```
+
+```{r refit best models using GAMs}
+# fits
+best_survivor_model_gam = gam(LOS ~ 1 + DRG * SEX + AGE * DIAGNOSIS + s(CHARGES_PRED) + AGEGROUP, family=Gamma(log), data=survivals)
+best_death_model_gam = gam(LOS ~ 1 + s(CHARGES_PRED), family=Gamma(log), data=deaths)
+
+# LRT tests
+anova(best_survivor_model, best_survivor_model_gam, test='F')
+anova(best_death_model, best_death_model_gam, test='F')
+
+```

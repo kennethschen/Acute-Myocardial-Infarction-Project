@@ -1,0 +1,364 @@
+---
+title: "STAT 149 Final Project"
+author: "Kenneth Chen, George Hu, Kay Lu"
+output: pdf_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(DMwR) # for SMOTE
+library(keras) # for neural networks
+library(mgcv) # for gam
+library(MLmetrics) # for F1 Score
+library(rpart) # for fitting tree models
+library(rpart.plot) # for plotting tree models
+use_session_with_seed(10)
+
+```
+
+```{r functions}
+minmaxscaler = function(x){
+  std = (x - min(x)) / (max(x) - min(x))
+  return(std*2-1)
+}
+
+source("na_convert.R") 
+
+```
+
+```{r prepare data}
+# import data
+ami_data = read.csv("amidata.csv")
+ami_data = ami_data[ami_data$LOS > 1, ]
+ami_data$LOS = ami_data$LOS - 1
+
+# ensure factor variables
+ami_data$DIAGNOSIS = as.factor(ami_data$DIAGNOSIS)
+ami_data$DRG = as.factor(ami_data$DRG)
+ami_data$DIED = as.factor(ami_data$DIED)
+ami_data$SEX = as.factor(ami_data$SEX)
+
+# na.convert.mean to handle for missing data
+ami_data = na.convert.mean(ami_data)
+ami_data$CHARGES.na = as.numeric(ami_data$CHARGES.na)
+
+# split dataframe into train and test for non-nn models
+test_prop = .2
+train_ind = sample(seq_len(nrow(ami_data)), size = (1-test_prop)*nrow(ami_data))
+train = ami_data[train_ind,]
+test = ami_data[-train_ind,]
+
+# create nn train df while converting factor to numeric
+ami_data_nn = ami_data
+ami_data_nn$DIAGNOSIS = as.numeric(ami_data_nn$DIAGNOSIS)
+ami_data_nn$DRG = as.numeric(ami_data_nn$DRG)
+ami_data_nn$DIED = as.numeric(ami_data_nn$DIED)
+ami_data_nn$SEX = as.numeric(ami_data_nn$SEX)
+ami_data_nn$CHARGES.na = as.numeric(ami_data_nn$CHARGES.na)
+
+# scale
+ami_data_nn = as.data.frame(sapply(ami_data_nn, minmaxscaler))
+
+# split dataframe into train and test
+train_nn = ami_data_nn[train_ind,]
+test_nn = ami_data_nn[-train_ind,]
+
+```
+
+```{r predict CHARGES}
+# arrange data for predicting CHARGES
+drops = c("CHARGES", "DIED", "DRG", "LOS", "Patient")
+X_train = train[,(!names(ami_data) %in% drops)]
+X_test = test[,(!names(ami_data) %in% drops)]
+y_train = train[,"CHARGES"] 
+y_test = test[,"CHARGES"]
+
+# glm
+m.glm = glm(CHARGES ~ AGE + SEX + DIAGNOSIS + CHARGES.na, family=Gamma(log), data=train)
+summary(m.glm)
+glm_res = predict(m.glm, X_test, type="response") - y_test
+glm_mse = sum((glm_res)^2) / length(y_test)
+
+# gam
+m.gam = gam(CHARGES ~ s(AGE) + SEX + DIAGNOSIS + CHARGES.na, family=Gamma(link="log"), data=train)
+summary(m.gam)
+gam_res = predict(m.gam, X_test, type="response") - y_test
+gam_mse = sum((gam_res)^2) / length(y_test)
+
+# tree and pruned tree
+m.tree = rpart(CHARGES ~ AGE + SEX + DIAGNOSIS + CHARGES.na, cp=0.0005, data=train, method="anova")
+printcp(m.tree)
+plotcp(m.tree)
+prp(m.tree, type=0, digits=3, main="Regression Tree for CHARGES")
+
+m.tree_pruned = rpart(CHARGES ~ AGE + SEX + DIAGNOSIS + CHARGES.na, cp=0.0011, data=train, method="anova")
+prp(m.tree_pruned, type=0, digits=3, main="Regression Tree for CHARGES")
+
+tree_res = predict(m.tree, X_test) - y_test
+tree_mse = sum((tree_res)^2) / length(y_test)
+pruned_tree_res = predict(m.tree_pruned, X_test) - y_test
+pruned_tree_mse = sum((pruned_tree_res)^2) / length(y_test)
+
+# clear tensorflow graph
+k_clear_session()
+
+# arrange nn data for predicting CHARGES
+drops = c("CHARGES", "DIED", "DRG", "LOS", "Patient")
+X_train_nn = train_nn[,(!names(ami_data_nn) %in% drops)]
+X_test_nn = test_nn[,(!names(ami_data_nn) %in% drops)]
+y_train_nn = train_nn[,"CHARGES"]
+y_test_nn = test_nn[,"CHARGES"]
+
+# NN for CHARGES
+model = keras_model_sequential()
+model %>% 
+  layer_dense(units = 512, activation = "tanh", input_shape = c(ncol(X_train_nn))) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 256, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 128, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 16, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1, activation = "linear") %>%
+
+summary(model)
+
+model %>% compile(
+  loss = "mse",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("mse")
+)
+
+history = model %>% fit(
+  as.matrix(X_train_nn), as.matrix(y_train_nn),
+  epochs = 30, batch_size = 128*20,
+  validation_split = 0.2,
+  shuffle=TRUE
+)
+
+plot(history)
+
+model %>% evaluate(as.matrix(X_test_nn), y_test_nn,verbose = 0)
+
+preds = (predict(model, as.matrix(X_test_nn))+1) * (max(ami_data$CHARGES) - min(ami_data$CHARGES)) / 2 + min(ami_data$CHARGES)
+reals = (y_test_nn + 1) * (max(ami_data$CHARGES) - min(ami_data$CHARGES)) / 2 + min(ami_data$CHARGES)
+nn_res = preds - reals
+nn_mse = sum((nn_res-y_test)^2) / length(y_test)
+```
+
+```{r CHARGES prediction model comparisons}
+# hist comparison
+par(mfrow=c(1,4))
+hist(glm_res, col="blue", main="CHARGE Prediction Residuals (GLM)", xlab = "Prediction-Actual CHARGE", ylab = "Frequency", breaks = 40)
+hist(gam_res, col="blue", main="CHARGE Prediction Residuals (GAM)", xlab = "Prediction-Actual CHARGE", ylab = "Frequency", breaks = 40)
+hist(pruned_tree_res, col="blue", main="CHARGE Prediction Residuals (Pruned Tree)", xlab = "Prediction-Actual CHARGE", ylab = "Frequency", breaks = 40)
+hist(nn_res, col="blue", main="CHARGE Prediction Residuals (FFNN)", xlab = "Prediction-Actual CHARGE", ylab = "Frequency", breaks = 40)
+
+# mse comparison
+print(sqrt(c(glm_mse, gam_mse, tree_mse, pruned_tree_mse, nn_mse)))
+
+# final mse
+final_res = predict(m.glm, ami_data, type="response") - ami_data$CHARGES
+print(sqrt(sum((final_res)^2)))
+hist(final_res, col="blue", main="CHARGE Prediction Residuals (GLM)", xlab = "Prediction-Actual CHARGE", ylab = "Frequency", breaks = 40)
+
+
+# save best predictions
+CHARGES_PRED = predict(m.glm, ami_data, type="response")
+# save(CHARGES_PRED, file="CHARGES_PRED.rda")
+```
+
+```{r enhance ami_data with CHARGES_PRED and SMOTE}
+# CHARGE PREDICTIONS
+load("CHARGES_PRED.rda")
+ami_data$CHARGES_PRED = CHARGES_PRED
+
+# SMOTE for DIED
+ami_data$DIED = as.factor(ami_data$DIED)
+ones = sum(as.numeric(ami_data$DIED)-1)
+zeros = nrow(ami_data) - ones
+ami_data_smote = SMOTE(DIED~., perc.over=zeros/ones*100, perc.under=0, data=ami_data)
+ami_data_smote = rbind(ami_data[ami_data$DIED==0,], ami_data_smote)
+
+# split dataframe into train and test for non-nn models
+test_prop = .2
+train_ind = sample(seq_len(nrow(ami_data_smote)), size = (1-test_prop)*nrow(ami_data_smote))
+train = ami_data_smote[train_ind,]
+test = ami_data_smote[-train_ind,]
+
+# create nn train df while converting factor to numeric
+ami_data_nn = ami_data_smote
+ami_data_nn$DIAGNOSIS = as.numeric(ami_data_nn$DIAGNOSIS)
+ami_data_nn$DRG = as.numeric(ami_data_nn$DRG)
+ami_data_nn$DIED = as.numeric(ami_data_nn$DIED)
+ami_data_nn$SEX = as.numeric(ami_data_nn$SEX)
+ami_data_nn$CHARGES.na = as.numeric(ami_data_nn$CHARGES.na)
+
+# rescale 
+ami_data_nn = as.data.frame(sapply(ami_data_nn, minmaxscaler))
+
+# keep DIED on original scale
+ami_data_nn$DIED = as.factor((ami_data_nn$DIED+1)/2)
+
+# split dataframe into train and test
+train_nn = ami_data_nn[train_ind,]
+test_nn = ami_data_nn[-train_ind,]
+```
+
+```{r predict DIED}
+# arrange data for predicting CHARGES
+drops = c("DIED", "DRG", "LOS", "Patient")
+X_train = train[,(!names(ami_data_smote) %in% drops)]
+X_test = test[,(!names(ami_data_smote) %in% drops)]
+y_train = train[,"DIED"]
+y_test = test[,"DIED"]
+
+# glm
+m.glm = glm(DIED ~ AGE + SEX + DIAGNOSIS + CHARGES.na, family=binomial, data=train)
+summary(m.glm)
+preds = round(predict(m.glm, X_test, type="response"))
+idxs0 = which(preds==0)
+idxs1 = which(preds==1)
+glm_tp = sum(preds[idxs1] == y_test[idxs1]) / sum(y_test==1)
+glm_tn = sum(preds[idxs0] == y_test[idxs0]) / sum(y_test==0)
+glm_acc = sum(preds == y_test) / length(y_test)
+
+# gam
+m.gam = gam(DIED ~ s(AGE) + SEX + DIAGNOSIS + CHARGES.na, family=binomial, data=train)
+summary(m.gam)
+preds = round(predict(m.gam, X_test, type="response"))
+idxs0 = which(preds==0)
+idxs1 = which(preds==1)
+gam_tp = sum(preds[idxs1] == y_test[idxs1]) / sum(y_test==1)
+gam_tn = sum(preds[idxs0] == y_test[idxs0]) / sum(y_test==0)
+gam_acc = sum(preds == y_test) / length(y_test)
+
+# tree and pruned tree
+m.tree = rpart(DIED ~ AGE + SEX + DIAGNOSIS + CHARGES.na, cp=0.0001, data=train, method="class", parms=list(split="information"))
+plotcp(m.tree)
+prp(m.tree, type=0, digits=3, main="Classifcation Tree for DIED")
+
+m.tree_pruned = rpart(DIED ~ AGE + SEX + DIAGNOSIS + CHARGES.na, cp=0.00021, data=train, method="class", parms=list(split="information"))
+plotcp(m.tree_pruned)
+prp(m.tree_pruned, type=0, digits=3, main="Classification Tree for DIED")
+
+preds = round(predict(m.tree, X_test)[,2])
+idxs0 = which(preds==0)
+idxs1 = which(preds==1)
+tree_tp = sum(preds[idxs1] == y_test[idxs1]) / sum(y_test==1)
+tree_tn = sum(preds[idxs0] == y_test[idxs0]) / sum(y_test==0)
+tree_acc = sum(preds == y_test) / length(y_test)
+
+preds = round(predict(m.tree_pruned, X_test)[,2])
+idxs0 = which(preds==0)
+idxs1 = which(preds==1)
+pruned_tree_tp = sum(preds[idxs1] == y_test[idxs1]) / sum(y_test==1)
+pruned_tree_tn = sum(preds[idxs0] == y_test[idxs0]) / sum(y_test==0)
+pruned_tree_acc = sum(preds == y_test) / length(y_test)
+
+# clear tensorflow graph
+k_clear_session()
+
+# arrange nn data for predicting DIED
+drops = c("DIED", "DRG", "LOS", "Patient")
+X_train_nn = train_nn[,(!names(ami_data_nn) %in% drops)]
+X_test_nn = test_nn[,(!names(ami_data_nn) %in% drops)]
+y_train_nn = train_nn[,"DIED"]
+y_test_nn = test_nn[,"DIED"]
+
+# NN for CHARGES
+model = keras_model_sequential()
+model %>% 
+  layer_dense(units = 512, activation = "tanh", input_shape = c(ncol(X_train_nn))) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 256, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 128, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "tanh") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+summary(model)
+
+model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("accuracy")
+)
+
+history = model %>% fit(
+  as.matrix(X_train_nn), as.matrix(y_train_nn),
+  epochs = 200, batch_size = 128*20,
+  validation_split = 0.2,
+  shuffle=TRUE
+)
+
+plot(history)
+
+model %>% evaluate(as.matrix(X_test_nn), as.matrix(y_test_nn),verbose = 0)
+
+preds = round(predict(model, as.matrix(X_test_nn)))
+idxs0 = which(preds==0)
+idxs1 = which(preds==1)
+nn_tp = sum(preds[idxs1] == y_test[idxs1]) / sum(y_test_nn==1)
+nn_tn = sum(preds[idxs0] == y_test[idxs0]) / sum(y_test_nn==0)
+nn_acc = sum(preds == y_test) / length(y_test)
+```
+
+```{r DIED prediction model comparisons}
+# comparisons
+print(c(glm_tp, gam_tp, tree_tp, pruned_tree_tp, nn_tp))
+print(c(glm_tn, gam_tn, tree_tn, pruned_tree_tn, nn_tn))
+print(c(glm_acc, gam_acc, tree_acc, pruned_tree_acc, nn_acc))
+
+# create full nn train df while converting factor to numeric
+ami_data_nn = ami_data
+ami_data_nn$DIAGNOSIS = as.numeric(ami_data_nn$DIAGNOSIS)
+ami_data_nn$DRG = as.numeric(ami_data_nn$DRG)
+ami_data_nn$DIED = as.numeric(ami_data_nn$DIED)
+ami_data_nn$SEX = as.numeric(ami_data_nn$SEX)
+ami_data_nn$CHARGES.na = as.numeric(ami_data_nn$CHARGES.na)
+
+# rescale 
+ami_data_nn = as.data.frame(sapply(ami_data_nn, minmaxscaler))
+
+# keep DIED on original scale
+ami_data_nn$DIED = as.factor((ami_data_nn$DIED+1)/2)
+
+# save predictions for best models on the original un-SMOTED data
+DIED_PRED_NN = round(predict(model, as.matrix(ami_data_nn[,(!names(ami_data_nn) %in% drops)]), type="response"))
+# save(DIED_PRED_NN, file="DIED_PRED_NN.rda")
+DIED_PRED_TREE = round(predict(m.tree_pruned, ami_data)[,2])
+# save(DIED_PRED_TREE, file="DIED_PRED_TREE.rda")
+
+# metrics for best models on the original un-SMOTED data
+load("DIED_PRED_NN.rda")
+idxs0 = which(DIED_PRED_NN==0)
+idxs1 = which(DIED_PRED_NN==1)
+final_tp = sum(DIED_PRED_NN[idxs1] == ami_data$DIED[idxs1]) / sum(ami_data$DIED==1)
+final_tn = sum(DIED_PRED_NN[idxs0] == ami_data$DIED[idxs0]) / sum(ami_data$DIED==0)
+final_acc = sum(DIED_PRED_NN == ami_data$DIED) / nrow(ami_data)
+print(c(final_tp, final_tn, final_acc))
+print(F1_Score(ami_data$DIED, DIED_PRED_NN))
+
+load("DIED_PRED_TREE.rda")
+idxs0 = which(DIED_PRED_TREE==0)
+idxs1 = which(DIED_PRED_TREE==1)
+final_tp = sum(DIED_PRED_TREE[idxs1] == ami_data$DIED[idxs1]) / sum(ami_data$DIED==1)
+final_tn = sum(DIED_PRED_TREE[idxs0] == ami_data$DIED[idxs0]) / sum(ami_data$DIED==0)
+final_acc = sum(DIED_PRED_TREE == ami_data$DIED) / nrow(ami_data)
+print(c(final_tp, final_tn, final_acc))
+print(F1_Score(ami_data$DIED, DIED_PRED_TREE))
+
+```
